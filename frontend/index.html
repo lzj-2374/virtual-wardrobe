@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>虚拟衣柜 · AI 穿搭</title>
+    <script>
+      // 在 CSS 之前定好主题，避免刷新时先闪一下日间配色再切到夜间。
+      // 逻辑必须和 composables/useTheme.js 的 readInitial() 保持一致。
+      (function () {
+        var t
+        try { t = localStorage.getItem('vw_theme') } catch (e) {}
+        if (t !== 'dark' && t !== 'light') t = 'dark'
+        var r = document.documentElement
+        r.setAttribute('data-theme', t)
+        if (t === 'dark') r.classList.add('dark')
+        r.style.colorScheme = t
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

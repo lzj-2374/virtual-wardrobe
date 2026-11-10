@@ -1,0 +1,25 @@
+{
+  "name": "virtual-wardrobe-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "虚拟衣柜 AI 穿搭系统 - 前端（Vue3 + Vite + Element Plus）",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "axios": "^1.7.2",
+    "echarts": "^5.5.0",
+    "element-plus": "^2.7.6",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.31",
+    "vue-router": "^4.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.5",
+    "vite": "^5.3.3"
+  }
+}

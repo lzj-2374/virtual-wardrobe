@@ -1,0 +1,29 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+### 本机密钥（千万别提交） ###
+config/secrets.yml
+config/secrets.yaml
+config/secrets.properties
+
+### IntelliJ IDEA ###
+.idea/
+*.iws
+*.iml
+*.ipr
+
+### Eclipse ###
+.classpath
+.project
+.settings/
+
+### macOS / Windows ###
+.DS_Store
+Thumbs.db
+
+### Logs ###
+*.log
+logs/
+
+### 本地配置（含密码，不要提交） ###
+application-local.yml

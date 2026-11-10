@@ -1,0 +1,32 @@
+# ===== 旧版后端 =====
+# backend/ 是早期脚手架（54 个类），已被 backend-full（92 个类）取代。
+# 两份的 artifactId 都是 wardrobe，同时提交会让人分不清哪个是最终版。
+backend/
+
+# ===== 依赖与构建产物 =====
+# node_modules 有 1.3 万个文件、200MB，GitHub 网页上传单次只有 100 个文件的额度
+node_modules/
+dist/
+dist-ssr/
+target/
+
+# ===== 本机密钥，绝对不能提交 =====
+config/secrets.yml
+config/secrets.yaml
+config/secrets.properties
+application-local.yml
+*.pem
+*.p12
+
+# ===== IDE =====
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# ===== 系统与日志 =====
+.DS_Store
+Thumbs.db
+*.log
+logs/
