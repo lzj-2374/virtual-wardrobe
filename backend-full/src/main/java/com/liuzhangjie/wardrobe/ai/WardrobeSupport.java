@@ -96,6 +96,56 @@ public final class WardrobeSupport {
         return (s & season) != 0;
     }
 
+    /**
+     * 这件衣服在目标季节到底能不能穿——<b>硬门槛</b>，和打分用的 {@link #matchSeason} 分开。
+     * <p>
+     * 两者的区别是「扣分」还是「直接出局」：短裤在 15℃ 只扣 3 分，可衣柜里只有这一条裤子时
+     * 它照样会被选中，于是配出「短裤 + 长袖 + 薄外套」——扣分是拦不住的，必须过滤。
+     * <p>
+     * 季节之外还要看厚薄：羽绒服就算标了「四季」，夏天也不该出现在推荐里；
+     * 同理冬天不该推只有薄款的短袖。这里只对「纯夏」「纯冬」两个极端值做厚薄判断，
+     * 春秋、四季这类模糊区间不设限——判太严会把本来能穿的衣服全筛掉。
+     */
+    public static boolean wearableIn(Clothing c, int season) {
+        Integer s = c.getSeason();
+        if (s != null && (s & season) == 0) {
+            return false;
+        }
+        Integer t = c.getThickness();
+        if (t == null) {
+            return true;
+        }
+        if (season == OutfitIntent.SUMMER && t == 3) {
+            return false;
+        }
+        return season != OutfitIntent.WINTER || t != 1;
+    }
+
+    /**
+     * 一组衣服共同能穿的季节（位与交集），用来把「用户点名的那几件」反推成这一轮的季节基准。
+     * <p>
+     * 注意 15（四季）是全 1，与任何值做与都等于对方，天然不参与收窄；
+     * season 为 null 的衣服同样按"不参与"处理，因为认不出的季节不该限制别人。
+     *
+     * @return 交集；一件都认不出季节时返回 0
+     */
+    public static int commonSeason(List<Clothing> items) {
+        if (items == null || items.isEmpty()) {
+            return 0;
+        }
+        int result = 0;
+        boolean any = false;
+        for (Clothing c : items) {
+            Integer s = c.getSeason();
+            if (s == null || s == 0) {
+                continue;
+            }
+            result = any ? (result & s) : s;
+            any = true;
+        }
+        return any ? result : 0;
+    }
+
     /** 读出来一件衣服的颜色，用于拼「主色：白 / 点缀：米」这类说明 */
     public static String colorOf(Clothing c) {
         return c.getColor() == null || c.getColor().isBlank() ? "无明确主色" : c.getColor();

@@ -59,7 +59,12 @@ public class DashScopeImageEditor {
      * <p>
      * 这套措辞是拿真实 key 反复调出来的，别随手改：
      * <ul>
-     *   <li>必须写明"全部单品（上衣、下装、外套、鞋）"，只说"穿在身上"模型会漏掉下装</li>
+     *   <li>品类清单必须<b>由调用方按实际单品传进来</b>（{@code {pieces}}）。早先这里写死
+     *       「上衣、下装、外套、鞋」，一套只有 T恤+短裤的搭配传进去，模型会老老实实
+     *       再给模特加一件外套——因为指令告诉它这套里有外套。写死清单是为了防"漏掉下装"，
+     *       但代价是"凭空多出没买过的衣服"，后者更致命：效果图里的衣服在衣柜里找不到，
+     *       等于推翻了"基于真实衣物"这个卖点</li>
+     *   <li>必须再补一句"不要额外添加图中没有的单品"，光列清单模型仍可能自由发挥</li>
      *   <li>必须写明"不要重新设计"，否则模型会按自己的审美重画版型</li>
      *   <li>必须写明"不要出现文字"，平铺图里带中文标签，模型会顺手把标签画进成图</li>
      *   <li>模特是谁要说清楚。不写性别时模型自己挑，同一套搭配两次出的图可能一男一女，
@@ -69,7 +74,8 @@ public class DashScopeImageEditor {
      * 万一里面混进一个百分号，String.format 会直接抛异常把整张图搞失败。
      */
     private static final String INSTRUCTION_TEMPLATE =
-            "让{subject}穿上图中这套搭配的全部单品（上衣、下装、外套、鞋），生成正面全身照。"
+            "让{subject}穿上图中这套搭配的全部单品（{pieces}），生成正面全身照。"
+                    + "只画这几件，不要额外添加图中没有的单品。"
                     + "严格保留每件衣服的款式、颜色、材质和细节，不要重新设计。"
                     + "纯浅灰背景，影棚柔光，正面站姿。"
                     + "画面中不要出现任何文字、字母、水印、标签。"
@@ -100,11 +106,13 @@ public class DashScopeImageEditor {
      * @param baseImageUrl 底图地址，必须是公网可访问的（这里就是刚上传到 OSS 的平铺图）
      * @param theme        搭配主题，会被拼进指令
      * @param gender       模特性别：1 男 / 2 女 / null 未指定（交给模型自己挑）
+     * @param pieces       这套搭配实际包含的位置，如「上装、下装」。必须由调用方按真实单品给，
+     *                     不能在这里写死——写死会让模型把没有的外套也画上去
      * @return 生成图的字节
      * @throws Exception 任何环节失败。调用方必须能接住并降级
      */
-    public byte[] edit(String baseImageUrl, String theme, Integer gender) throws Exception {
-        String taskId = submit(baseImageUrl, theme, gender);
+    public byte[] edit(String baseImageUrl, String theme, Integer gender, String pieces) throws Exception {
+        String taskId = submit(baseImageUrl, theme, gender, pieces);
         String resultUrl = poll(taskId);
         return download(resultUrl);
     }
@@ -125,7 +133,7 @@ public class DashScopeImageEditor {
         return SUBJECT_UNKNOWN;
     }
 
-    private String submit(String baseImageUrl, String theme, Integer gender) throws Exception {
+    private String submit(String baseImageUrl, String theme, Integer gender, String pieces) throws Exception {
         AiProperties.Image cfg = aiProperties.getImage();
 
         Map<String, Object> input = new LinkedHashMap<>();
@@ -133,6 +141,7 @@ public class DashScopeImageEditor {
         // 老版 wanx2.1 用的是 {function, prompt, base_image_url}，两者不通用，换模型必须同步改这里。
         String instruction = INSTRUCTION_TEMPLATE
                 .replace("{subject}", subjectOf(gender))
+                .replace("{pieces}", pieces == null || pieces.isBlank() ? "单品" : pieces)
                 .replace("{theme}", theme == null ? "日常" : theme);
         log.debug("万相指令：{}", instruction);
         input.put("prompt", instruction);

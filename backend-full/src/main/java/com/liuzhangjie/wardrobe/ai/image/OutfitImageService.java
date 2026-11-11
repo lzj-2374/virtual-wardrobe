@@ -4,7 +4,9 @@ import com.liuzhangjie.wardrobe.config.AiProperties;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 效果图生成的总入口：先合成，能接模型就再接一步换成上身图。
@@ -57,7 +59,7 @@ public class OutfitImageService {
         }
 
         try {
-            byte[] edited = editor.edit(flatLayUrl, outfitName + "，" + scene, gender);
+            byte[] edited = editor.edit(flatLayUrl, outfitName + "，" + scene, gender, describePieces(items));
             String finalUrl = storage.upload(edited, "png");
             log.info("万相生图成功，结果：{}", finalUrl);
             return finalUrl;
@@ -72,8 +74,30 @@ public class OutfitImageService {
         }
     }
 
-    private boolean shouldCallModel() {
-        String provider = aiProperties.getImage().getProvider();
+    /**
+     * 这套搭配实际包含哪些位置，拼成「上装、下装」这种给模型看的清单。
+     * <p>
+     * 必须按真实单品算，不能写死。写死「上衣、下装、外套、鞋」的话，
+     * 一套只有 T恤+短裤的搭配传进去，模型会照着清单自作主张再添一件外套——
+     * 效果图里出现一件衣柜里根本没有的衣服，等于把"基于真实衣物"这个卖点废掉。
+     * <p>
+     * 用 LinkedHashSet 去重并按加入顺序输出：同一个位置在一套里只会有一件
+     * （{@code uk_rec_role} 兜着），顺序就是上装→下装→外套→鞋→配饰，读起来自然。
+     */
+    private String describePieces(List<OutfitImageComposer.RenderItem> items) {
+        if (items == null || items.isEmpty()) {
+            return "单品";
+        }
+        Set<String> labels = new LinkedHashSet<>();
+        for (OutfitImageComposer.RenderItem item : items) {
+            if (item.getRoleLabel() != null && !item.getRoleLabel().isBlank()) {
+                labels.add(item.getRoleLabel());
+            }
+        }
+        return labels.isEmpty() ? "单品" : String.join("、", labels);
+    }
+
+    private boolean shouldCallModel() {        String provider = aiProperties.getImage().getProvider();
         if ("composite".equalsIgnoreCase(provider)) {
             return false;
         }

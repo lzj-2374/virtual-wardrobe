@@ -22,6 +22,9 @@
       <ChatBubble v-for="(m, i) in messages" :key="i" :role="m.role">
         <div>
           <p class="msg-text">{{ m.content }}</p>
+          <!-- 把这句问话当时"钉"了哪几件一起记下来。输入框上方那条标签发完不会消失，
+               单看它分不清是"这轮已经发了"还是"还没发"，回看时也没有依据 -->
+          <p v-if="m.pinned && m.pinned.length" class="msg-pinned">已指定：{{ m.pinned.join('、') }}</p>
           <div v-if="m.recommendations && m.recommendations.length" class="rec-list">
             <el-card v-for="rec in m.recommendations" :key="rec.id" class="rec-card" shadow="hover">
               <div class="rec-head">
@@ -260,7 +263,7 @@ const roleName = (r) => roleNames[r] || '单品'
 async function send() {
   const text = input.value.trim()
   if (!text || sending.value) return
-  messages.push({ role: 'user', content: text })
+  messages.push({ role: 'user', content: text, pinned: pinned.value.map((p) => p.name) })
   input.value = ''
   sending.value = true
   scroll()
@@ -276,7 +279,14 @@ async function send() {
       clothingIds: pinned.value.map((c) => c.id)
     })
     if (res.conversationId) conversationId.value = res.conversationId
-    messages.push({ role: 'ai', content: '为你推荐以下搭配：', recommendations: res.recommendations })
+    // 正文用后端带回来的 reply，不要在前端写死一句"为你推荐以下搭配："——
+    // 「已按你指定的 1 件单品来搭」「衣柜里能穿的只有 1 件上装」这些解释都在服务端生成，
+    // 写死就等于把它们丢掉，用户永远不知道系统为什么只给了一两套
+    messages.push({
+      role: 'ai',
+      content: res.reply || '为你推荐以下搭配：',
+      recommendations: res.recommendations
+    })
     saveSession()
   } catch (e) {
     messages.push({ role: 'ai', content: '抱歉，推荐出了点问题，请稍后再试。' })
@@ -294,6 +304,9 @@ const POLL_INTERVAL_MS = 1500
 // 后端的预算：等万相出图最多 120s，再加上下载 + 传 OSS，整条链路最坏 150s 上下。
 // 前端必须比它长，否则后端还在跑，这边先报超时，等于白问。给到 240s 留足余量。
 const POLL_MAX_MS = 240000
+// 退避上限。万相出图要 60s，间隔一路翻下去会变成"越到关键时刻问得越稀"，
+// 10 秒一次是能接受的粒度：出图后最多再等 10 秒页面就会有反应。
+const POLL_BACKOFF_MAX_MS = 10000
 
 async function genImage(rec) {
   if (rec._generating) return
@@ -316,43 +329,62 @@ async function genImage(rec) {
 }
 
 // 轮询生图状态（后端由 RabbitMQ 消费者异步出图）
+//
+// 两个刻意的写法，都是为了别把请求打成一堆：
+//
+// ① 递归 setTimeout，不用 setInterval。setInterval 到点就触发，不管上一次有没有返回；
+//    后端某次慢到 5 秒时，1.5 秒的间隔里会叠着发出去三四个请求，越慢积得越多。
+//    递归是"上一次落地了才排下一次"，天然不重叠。
+// ② 间隔做退避（1.5 → 3 → 6 → 10 封顶）。万相前 20 秒几乎不可能出图，
+//    固定 1.5 秒等于每分钟问 40 次空转，退避后一次生图只要 8 条左右。
 function pollImage(rec, taskId) {
   rec._generating = true
   const startedAt = Date.now()
-  const timer = setInterval(async () => {
+  let delay = POLL_INTERVAL_MS
+
+  // tick 内部要引用自己，所以必须是具名函数，不能写成匿名箭头
+  const tick = async () => {
     if (Date.now() - startedAt > POLL_MAX_MS) {
-      clearInterval(timer)
       rec._generating = false
       // 故意不动 imageStatus、也不清 taskId：后端多半还在跑，
       // 按钮会变成「再查一次」，点一下接着等，不用重新生成
       ElMessage.warning('生图比预期慢，4 分钟还没出结果。可以点「再查一次」继续等。')
       saveSession()
+      // 直接 return 就是"不再排下一次"，不用像 setInterval 那样显式 clear
       return
     }
     try {
       const st = await getImageStatus(taskId)
       if (st.status === 2) {
-        clearInterval(timer)
         rec.imageStatus = 2
         rec.imageUrl = st.imageUrl
         rec._taskId = null
         rec._generating = false
         // 立刻存一次：不然用户刚出图就切走页面，回来又得重新生成
         saveSession()
-      } else if (st.status === 3) {
-        clearInterval(timer)
+        return
+      }
+      if (st.status === 3) {
         rec.imageStatus = 0
         rec._taskId = null
         rec._generating = false
         ElMessage.error('生图失败，可重试')
         saveSession()
+        return
       }
-      // 还是 1（生成中）：什么也不做，下一轮接着问
+      // 还是 1（生成中）：什么也不做，交给下面的退避
     } catch (e) {
       // 单次请求失败大概率是网络抖了一下，不判死刑，交给下一轮；
       // 真正的兜底是上面的时间上限，不会无限轮询
     }
-  }, POLL_INTERVAL_MS)
+    // 只有"还在生成"或"这次查询失败"才会走到这里，间隔翻倍但不超过上限
+    delay = Math.min(delay * 2, POLL_BACKOFF_MAX_MS)
+    setTimeout(tick, delay)
+  }
+
+  // setTimeout 不会像 setInterval 那样自己开始，第一次必须手动踢一脚。
+  // 漏了这行 = 点完按钮一个请求都不发，页面永远停在骨架屏
+  setTimeout(tick, POLL_INTERVAL_MS)
 }
 
 // 显示用的 src。正常情况下就是后端给的地址；失败重试过一次时带上 _r 参数绕缓存。
@@ -618,6 +650,9 @@ onMounted(async () => {
 .chat-box { flex: 1; overflow-y: auto; padding-right: 8px; }
 .typing { margin: 8px 0 8px 40px; font-size: 13px; }
 .msg-text { margin: 0 0 8px; }
+/* 用户气泡里的"已指定"。字号压到 11px、用静音色：它是旁注，不该和提问正文抢注意力 */
+.msg-pinned { margin: -4px 0 8px; font-size: 11px; letter-spacing: .02em; color: var(--vw-ink-mute); }
+.msg-pinned + .rec-list { margin-top: 0; }
 .rec-list { display: flex; flex-direction: column; gap: 12px; }
 .rec-card { border-radius: 3px; }
 .rec-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }

@@ -16,6 +16,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -38,6 +39,18 @@ public class DeepSeekOutfitAdvisor implements OutfitAdvisor {
     private static final int MAX_OUTFITS = 3;
 
     /**
+     * 送进提示词的衣柜条数上限。
+     * <p>
+     * 不设上限的话，提示词长度跟用户衣柜呈线性关系：实测每件衣服约 54 字（≈27 token），
+     * 11 件只要 294 token，200 件就要 5009 token，到 800 件就顶到 2 万。
+     * 衣柜越大越贵、越慢，而推荐质量并不会因为多给 300 件而变好——模型本来也挑不过来。
+     * <p>
+     * 取 50 是为了凑一个能对外承诺的整数：输入约 1800 token，加输出上限 1200，
+     * 单次请求稳定在 3000 token 以内。超出的部分按「指定的 > 当季能穿的 > 其余」优先保留。
+     */
+    private static final int MAX_PROMPT_ITEMS = 50;
+
+    /**
      * 系统提示词。写死在代码里而不是塞进数据库：
      * 它是"接口约定"的一部分，改它就得同步改解析逻辑，两者必须一起提交、一起评审。
      */
@@ -51,9 +64,18 @@ public class DeepSeekOutfitAdvisor implements OutfitAdvisor {
             3. role 取值：1 上装 / 2 下装 / 3 外套 / 4 鞋 / 5 配饰。同一套搭配里 role 不能重复。
             4. season 取值：1 春 / 2 夏 / 4 秋 / 8 冬 / 15 四季。
             5. clothingId 必须来自用户衣柜列表里出现过的 ID，不许新造。
-            6. 给出 1 到 3 套，套与套之间要有明显区别（换单品或换风格），不要三套只是鞋不一样。
-            7. 每一套至少要有一件 role=1 的上装（套装、连衣裙也算上装）。
+            6. 给出 1 到 3 套。套数按衣柜的实际情况给：能搭出几套就给几套，凑不满 3 套就给 1~2 套，
+               绝对不要为了凑数硬拼不合理的组合。套与套之间要有明显区别（换单品或换风格）。
+            7. 每一套至少要有一件 role=1 的上装。普通上装必须再配一条下装；
+               只有套装、连衣裙这类本身成套的单品才可以单穿，不允许只给一件上衣。如果衣柜里
+               没有下装也没有套装，返回 {"outfits":[]}。
             8. 如果衣柜里的衣服不足以搭出一套，返回 {"outfits":[]}。
+            9. 季节必须自洽。同一套里所有单品的季节要一致：短裤、短袖属于夏装，羽绒服、毛衣属于冬装，
+               不允许把夏装和长袖外套、春秋风衣放进同一套。
+            10. 用户指定单品时，那件单品的季节就是这一套的季节基准，其他单品都要向它看齐。
+                即使上文提到过不同的气温，也以用户指定的单品为准，不要去论证"这个温度穿它刚好"。
+            11. 衣柜里缺某个位置（比如一件鞋都没有）就只用现有的单品，把搭配件数减少即可，
+                不要编造，也不要拿别的品类顶替。
             """;
 
     private final AiProperties aiProperties;
@@ -86,9 +108,92 @@ public class DeepSeekOutfitAdvisor implements OutfitAdvisor {
             return List.of();
         }
 
-        String userPrompt = buildUserPrompt(message, intent, wardrobe, history, pinnedClothingIds);
+        // 送模型的清单和校验用的清单必须是同一份：先用截断后的池子拼提示词，
+        // 再用同一个池子校验模型返回的 id。否则模型会"看到"50 件、却可能返回被截掉的 id，
+        // 校验时又通过了，落库后详情页就指向一件它从没见过的衣服
+        List<Clothing> promptPool = promptWardrobe(wardrobe, intent, pinnedClothingIds);
+
+        String userPrompt = buildUserPrompt(message, intent, promptPool, history, pinnedClothingIds);
         String raw = callModel(userPrompt);
-        return enforcePinned(parse(raw, intent, wardrobe), pinnedClothingIds);
+        List<OutfitDraft> drafts = parse(raw, intent, promptPool);
+        drafts = enforceSeason(drafts, intent, promptPool);
+        return enforcePinned(drafts, pinnedClothingIds);
+    }
+
+    /**
+     * 挑出真正要送进提示词的那一批衣服，条数不超过 {@link #MAX_PROMPT_ITEMS}。
+     * <p>
+     * 截断的顺序有讲究，不是简单取前 50 条：
+     * <ol>
+     *   <li><b>用户指定的</b>必须留——它们是本轮硬约束，被截掉就等于没指定</li>
+     *   <li><b>当季能穿的</b>优先——冬天把一柜子短袖塞给模型，既费 token 又只会干扰它</li>
+     *   <li>剩下的按衣柜原顺序补位，保证换季时仍有素材</li>
+     * </ol>
+     * 衣柜没超过上限时原样返回，不改变任何现有行为。
+     */
+    private List<Clothing> promptWardrobe(List<Clothing> wardrobe, OutfitIntent intent, List<Long> pinned) {
+        if (wardrobe.size() <= MAX_PROMPT_ITEMS) {
+            return wardrobe;
+        }
+        Set<Long> keep = pinned == null ? Set.of() : new java.util.HashSet<>(pinned);
+        List<Clothing> picked = new ArrayList<>();
+        Set<Long> taken = new java.util.HashSet<>();
+
+        for (Clothing c : wardrobe) {
+            if (keep.contains(c.getId()) && picked.size() < MAX_PROMPT_ITEMS) {
+                picked.add(c);
+                taken.add(c.getId());
+            }
+        }
+        for (Clothing c : wardrobe) {
+            if (picked.size() >= MAX_PROMPT_ITEMS) {
+                break;
+            }
+            if (!taken.contains(c.getId()) && WardrobeSupport.wearableIn(c, intent.season())) {
+                picked.add(c);
+                taken.add(c.getId());
+            }
+        }
+        for (Clothing c : wardrobe) {
+            if (picked.size() >= MAX_PROMPT_ITEMS) {
+                break;
+            }
+            if (taken.add(c.getId())) {
+                picked.add(c);
+            }
+        }
+        log.info("衣柜 {} 件超出单次提示词上限，实际送入 {} 件（指定的与当季的优先）",
+                wardrobe.size(), picked.size());
+        return picked;
+    }
+
+    /**
+     * 模型返回后的第二道闸：把含"这个季节穿不了的单品"的整套丢掉。
+     * <p>
+     * 提示词里写了「季节必须自洽」，但这类语义约束正是小模型最容易漏的——
+     * 实测就出现过把夏装短裤和春秋长袖、薄外套搭在一套里，还配了句「15 度穿刚好」。
+     * 与其相信模型会自觉，不如在返回后按衣柜数据核一遍：
+     * 每件衣服的季节字段是我们自己识别出来存库的，比模型的自由发挥可靠。
+     * <p>
+     * 一套都不剩就抛异常，让路由器降级到规则引擎。降级不是失败——
+     * 规则引擎的候选池是按季节硬过滤过的，出来的东西一定不自相矛盾。
+     */
+    private List<OutfitDraft> enforceSeason(List<OutfitDraft> drafts, OutfitIntent intent, List<Clothing> wardrobe) {
+        Map<Long, Clothing> byId = wardrobe.stream()
+                .collect(Collectors.toMap(Clothing::getId, c -> c, (a, b) -> a));
+        List<OutfitDraft> kept = drafts.stream()
+                .filter(d -> d.items().stream()
+                        .map(i -> byId.get(i.clothingId()))
+                        .filter(Objects::nonNull)
+                        .allMatch(c -> WardrobeSupport.wearableIn(c, intent.season())))
+                .toList();
+        if (kept.isEmpty()) {
+            throw new IllegalStateException("模型给出的搭配与当前季节都不自洽，降级到规则引擎");
+        }
+        if (kept.size() < drafts.size()) {
+            log.info("季节校验丢弃了 {} 套不自洽的搭配，保留 {} 套", drafts.size() - kept.size(), kept.size());
+        }
+        return kept;
     }
 
     /**

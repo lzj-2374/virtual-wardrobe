@@ -11,6 +11,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -64,6 +65,10 @@ public class RuleBasedOutfitAdvisor implements OutfitAdvisor {
         // 1.5 用户指定了必选单品的话，把这些位置的候选池收窄到只剩它们
         byRole = restrictToPinned(byRole, pinnedIds);
 
+        // 1.6 再把「这个季节根本穿不了」的整件剔出去。
+        //     放在收窄之后：先保证用户点的东西不被别人挤掉，再谈合不合季节
+        byRole = dropUnwearable(byRole, intent.season(), pinnedIds);
+
         // 被指定的单品分别属于哪些位置，后面用来放宽"外套只在冷天加""配饰只在约会加"这两道门
         Set<Integer> pinnedRoles = wardrobe.stream()
                 .filter(c -> pinnedIds.contains(c.getId()))
@@ -77,6 +82,19 @@ public class RuleBasedOutfitAdvisor implements OutfitAdvisor {
             return List.of();
         }
         List<Scored> bottoms = byRole.getOrDefault(WardrobeSupport.ROLE_BOTTOM, List.of());
+
+        // 一条下装都没有时，只有「本身成套」的套装/连衣裙能单穿。
+        // 普通上装孤零零一件不能算一套搭配——真返回出去，用户看到的是"推荐了一件T恤"，
+        // 还不如直接说衣柜不够。套装用 category=4 判定，它的 role 也是上装。
+        if (bottoms.isEmpty()) {
+            tops = tops.stream()
+                    .filter(s -> Objects.equals(s.item().getCategory(), 4))
+                    .collect(Collectors.toList());
+            if (tops.isEmpty()) {
+                log.debug("没有下装也没有套装，凑不成一套完整搭配");
+                return List.of();
+            }
+        }
         List<Scored> outers = byRole.getOrDefault(WardrobeSupport.ROLE_OUTER, List.of());
         List<Scored> shoes = byRole.getOrDefault(WardrobeSupport.ROLE_SHOES, List.of());
         List<Scored> accessories = byRole.getOrDefault(WardrobeSupport.ROLE_ACCESSORY, List.of());
@@ -208,6 +226,33 @@ public class RuleBasedOutfitAdvisor implements OutfitAdvisor {
     }
 
     // ===================== 组合与文案 =====================
+
+    /**
+     * 把当前季节穿不了的单品从候选池里整件剔掉。
+     * <p>
+     * 为什么必须是"剔除"而不是"在 {@link #score} 里扣分"：扣分只在候选充足时有用。
+     * 用户衣柜里往往只有一两条裤子，那条夏装短裤就算扣 3 分也还是唯一选项，
+     * 于是 15℃ 的天气照样能配出「短裤 + 长袖 + 薄外套」——这类错误一眼就能看出，
+     * 不能靠分数去"尽量避开"，只能不让它进场。
+     * <p>
+     * 剔除之后某个位置空了是正常结果（比如夏天过滤掉所有外套），
+     * {@link #buildCombo} 会自然跳过这个位置，搭出件数更少的组合，而不是硬塞一件。
+     * <p>
+     * 用户点名的单品不参与剔除：那是他明确要看的，季节基准已经在
+     * {@code AiServiceImpl} 里跟着它调整过了。
+     */
+    private Map<Integer, List<Scored>> dropUnwearable(Map<Integer, List<Scored>> byRole,
+                                                     int season, Set<Long> pinnedIds) {
+        Map<Integer, List<Scored>> filtered = new LinkedHashMap<>();
+        for (Map.Entry<Integer, List<Scored>> e : byRole.entrySet()) {
+            List<Scored> kept = e.getValue().stream()
+                    .filter(s -> pinnedIds.contains(s.item().getId())
+                            || WardrobeSupport.wearableIn(s.item(), season))
+                    .collect(Collectors.toList());
+            filtered.put(e.getKey(), kept);
+        }
+        return filtered;
+    }
 
     /**
      * 用指定的一件上装、一件下装，配上外套/鞋/配饰，凑成一套。

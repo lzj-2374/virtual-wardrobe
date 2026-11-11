@@ -17,7 +17,8 @@ spring:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: "jdbc:mysql://localhost:3306/virtual_wardrobe?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true"
     username: root
-    password: 1234
+    # 本机开发默认 1234；换机器或改密码用环境变量 DB_PASSWORD 覆盖，不必改文件
+    password: ${DB_PASSWORD:1234}
     hikari:
       # 建库之前也能正常启动；-1 表示启动时不去校验连接。数据库建好后可以删掉这行
       initialization-fail-timeout: -1

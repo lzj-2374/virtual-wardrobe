@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.liuzhangjie.wardrobe.ai.OutfitAdvisorRouter;
 import com.liuzhangjie.wardrobe.ai.OutfitDraft;
 import com.liuzhangjie.wardrobe.ai.OutfitIntent;
+import com.liuzhangjie.wardrobe.ai.WardrobeSupport;
 import com.liuzhangjie.wardrobe.common.BusinessException;
 import com.liuzhangjie.wardrobe.common.ResultCode;
 import com.liuzhangjie.wardrobe.entity.AiChatDTO;
@@ -157,7 +158,7 @@ public class AiServiceImpl implements AiService {
             saveMessage(conversation.getId(), AiMessage.ROLE_AI,
                     ResultCode.AI_WARDROBE_EMPTY.getMessage(), null);
             touchConversation(conversation);
-            return new AiChatVO(conversation.getId(), new ArrayList<>());
+            return new AiChatVO(conversation.getId(), ResultCode.AI_WARDROBE_EMPTY.getMessage(), new ArrayList<>());
         }
 
         // 3. 取最近几轮对话当上下文。
@@ -174,6 +175,14 @@ public class AiServiceImpl implements AiService {
 
         // 4.5 输入框「+」点名的单品：先跟衣柜求交集，再把硬约束交给引擎
         List<Long> pinned = resolvePinned(dto.getClothingIds(), wardrobe);
+        List<Clothing> pinnedItems = wardrobe.stream()
+                .filter(c -> pinned.contains(c.getId()))
+                .toList();
+
+        // 4.6 季节基准要向「用户亲手点的那件」看齐，而不是向上一轮继承来的气温看齐。
+        //     不这么做就会出现：上一轮问过「15 度穿什么」，这一轮点了一条夏装短裤，
+        //     引擎按"春秋"去配长袖和薄外套，然后被强制塞进一件短裤，配出「15 度穿短裤刚好」。
+        intent = alignSeasonWithPinned(intent, pinnedItems);
 
         List<OutfitDraft> drafts = advisorRouter.advise(message, intent, wardrobe, historyLines, pinned);
 
@@ -192,16 +201,19 @@ public class AiServiceImpl implements AiService {
         saveMessage(conversation.getId(), AiMessage.ROLE_USER, message, null);
         String reply;
         if (vos.isEmpty()) {
-            reply = "衣柜里的单品还凑不出一套完整搭配，再补充几件上衣或裤子试试。";
+            // 说清楚"缺的是什么"，不要只说"凑不出"。用户下一步才知道该补什么
+            reply = "这个季节还搭不出来：" + gapDetail(wardrobe, intent.season())
+                    + "。先去衣柜里添几件，我再帮你搭。";
         } else {
             StringBuilder sb = new StringBuilder("为你推荐了 ").append(vos.size()).append(" 套搭配");
             if (!pinned.isEmpty()) {
                 sb.append("，已按你指定的 ").append(pinned.size()).append(" 件单品来搭");
-                // 指定是硬约束：钉住上装+下装后，只剩鞋和配饰能换，凑不满 3 套是正常的。
-                // 不说这一句，用户会以为接口只返回了一套、是 bug
-                if (vos.size() < 3) {
-                    sb.append("。指定得越具体，能替换的位置就越少，多备几件同类单品就能搭出更多套");
-                }
+            }
+            // 不满 3 套时给出原因，否则用户会以为是接口只返回了一两套、是 bug
+            if (vos.size() < 3) {
+                sb.append("。衣柜里当前季节能穿的只有 ")
+                        .append(gapDetail(wardrobe, intent.season()))
+                        .append("，添几件同类单品就能搭出更多套");
             }
             sb.append("（引擎：").append(advisorRouter.activeEngineName()).append("）");
             reply = sb.toString();
@@ -210,7 +222,7 @@ public class AiServiceImpl implements AiService {
 
         touchConversation(conversation);
 
-        return new AiChatVO(conversation.getId(), vos);
+        return new AiChatVO(conversation.getId(), reply, vos);
     }
 
     @Override
@@ -308,6 +320,70 @@ public class AiServiceImpl implements AiService {
                 .distinct()
                 .limit(MAX_PINNED)
                 .toList();
+    }
+
+    /**
+     * 把这一轮的季节基准向「用户亲手点名的单品」对齐。
+     * <p>
+     * 起因是一个真实翻车：用户上一轮问过「明天 15 度穿什么」，这一轮点了条夏装短裤问
+     * 「这条裤子搭配什么合适呢」。第二句本身读不出季节，于是从上一轮继承了 15℃→春秋，
+     * 引擎就按春秋配了长袖和薄外套，再被硬约束塞进一条短裤，最后写出
+     * 「短裤配长袖薄外套，15 度穿刚好」这种自相矛盾的推荐。
+     * <p>
+     * 判断顺序：<b>用户显式选择 > 从上下文继承的气温</b>。人不会不知道自己手里拿的是短裤，
+     * 但很可能忘了自己上一句说过多少度。
+     * <p>
+     * 气温在冲突时一并清掉——留着它，模型还是会拿"15 度"去解释一套夏装。
+     */
+    private OutfitIntent alignSeasonWithPinned(OutfitIntent intent, List<Clothing> pinnedItems) {
+        if (pinnedItems.isEmpty()) {
+            return intent;
+        }
+        int pinnedSeason = WardrobeSupport.commonSeason(pinnedItems);
+        if (pinnedSeason == 0) {
+            // 这几件都认不出季节（识别失败的脏数据），没有依据可对齐，保持原样
+            return intent;
+        }
+        int merged = intent.season() & pinnedSeason;
+        if (merged == 0) {
+            // 完全冲突：以指定的单品为准。同时把气温丢掉，否则提示词里会出现
+            // 「季节=夏，当前气温=15℃」这种自相矛盾的两句话
+            log.info("指定的单品与继承的季节冲突，季节基准改为 {}（原 {}），气温 {} 已忽略",
+                    OutfitIntent.seasonName(pinnedSeason),
+                    OutfitIntent.seasonName(intent.season()), intent.temperature());
+            return new OutfitIntent(intent.scene(), pinnedSeason, intent.styleHint(), null);
+        }
+        if (merged == intent.season()) {
+            return intent;
+        }
+        return new OutfitIntent(intent.scene(), merged, intent.styleHint(), intent.temperature());
+    }
+
+    /**
+     * 当前季节下衣柜里真正能穿的有多少件，拼成「3 件上装、1 件下装、0 双鞋」这种短句。
+     * <p>
+     * 统计口径必须是「过滤之后」而不是柜子里的总数：用户柜子里有十件羽绒服，
+     * 夏天等于一件都没有，报总数只会让他觉得系统在胡说。
+     * 这也是"推荐不满 3 套"时唯一能给用户的、可执行的解释。
+     */
+    private String gapDetail(List<Clothing> wardrobe, int season) {
+        Map<Integer, Long> usable = wardrobe.stream()
+                .filter(c -> WardrobeSupport.wearableIn(c, season))
+                .collect(Collectors.groupingBy(WardrobeSupport::roleOf, Collectors.counting()));
+        long tops = usable.getOrDefault(WardrobeSupport.ROLE_TOP, 0L);
+        long bottoms = usable.getOrDefault(WardrobeSupport.ROLE_BOTTOM, 0L);
+        long outers = usable.getOrDefault(WardrobeSupport.ROLE_OUTER, 0L);
+        long shoes = usable.getOrDefault(WardrobeSupport.ROLE_SHOES, 0L);
+        if (tops == 0 && bottoms == 0) {
+            return "一件能穿的上装或下装都没有";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append(tops).append(" 件上装、").append(bottoms).append(" 件下装");
+        if (outers > 0) {
+            sb.append("、").append(outers).append(" 件外套");
+        }
+        sb.append(shoes > 0 ? "、" + shoes + " 双鞋" : "、一双鞋都没有");
+        return sb.toString();
     }
 
     /**

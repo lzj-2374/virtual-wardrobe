@@ -39,7 +39,7 @@
       <span class="result-count text-muted">共 {{ total }} 件</span>
     </div>
 
-    <div v-loading="loading" class="grid-cards mt">
+    <div v-loading="loading" class="grid-cards mt" ref="gridRef">
       <ClothingCard
         v-for="c in list"
         :key="c.id"
@@ -61,7 +61,7 @@
         :total="total"
         :page-size="pageSize"
         :current-page="currentPage"
-        :page-sizes="[6, 12, 24, 48]"
+        :page-sizes="sizeOptions"
         @current-change="onPageChange"
         @size-change="onSizeChange"
       />
@@ -70,7 +70,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { Plus, Search, Delete, Select } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -100,8 +100,45 @@ const seasonFilter = ref('')
 const list = ref([])
 const loading = ref(false)
 const currentPage = ref(1)
-const pageSize = ref(6)
 const total = ref(0)
+
+// ---- 每页条数要跟着网格的列数走 ----
+// 网格用的是 auto-fill，一行能排几列由窗口宽度决定，所以每页条数不能写死。
+// 之前固定 6 条、而窗口刚好排 5 列，第 6 件就孤零零占一行，翻页后那一页还只有它一件。
+// 现在按实际列数算：一页正好放满两行，翻页永远整行整行地翻。
+const gridRef = ref(null)
+const columnCount = ref(5)
+const pageSize = ref(10)
+
+/** 读浏览器实际排出来的列数。computed 后的 grid-template-columns 是一串像素值，数几个就是几列 */
+function measureColumns() {
+  const el = gridRef.value
+  if (!el) return 0
+  const tmpl = getComputedStyle(el).gridTemplateColumns
+  if (!tmpl || tmpl === 'none') return 0
+  return tmpl.trim().split(/\s+/).length
+}
+
+// 下拉选项也跟着列数走。否则用户选个 12 条、而窗口排 5 列，第二行又会只剩 2 个
+const sizeOptions = computed(() => {
+  const c = columnCount.value || 5
+  return [c * 2, c * 3, c * 4, c * 6]
+})
+
+let gridObserver = null
+
+function syncColumns() {
+  const cols = measureColumns()
+  if (!cols || cols === columnCount.value) return
+  columnCount.value = cols
+  // 列数变了（拉窗口/换显示器），原来的条数就不再是整行，按"两行"重新取
+  if (pageSize.value !== cols * 2) {
+    pageSize.value = cols * 2
+    currentPage.value = 1
+    clearSelection()
+    load()
+  }
+}
 
 // 批量管理
 const batchMode = ref(false)
@@ -232,7 +269,20 @@ async function onBatchDelete() {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  // 列数要等浏览器把布局算完才知道，所以交给 ResizeObserver：
+  // 它 observe 之后会立刻回调一次，正好用来做首次对齐；之后拉窗口也会重新对齐
+  if (typeof ResizeObserver !== 'undefined' && gridRef.value) {
+    gridObserver = new ResizeObserver(syncColumns)
+    gridObserver.observe(gridRef.value)
+  }
+})
+
+onBeforeUnmount(() => {
+  gridObserver?.disconnect()
+  gridObserver = null
+})
 </script>
 
 <style scoped>
