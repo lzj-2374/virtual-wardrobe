@@ -188,4 +188,4 @@ POST /ai/image/generate  →  落任务记录 + 投递 MQ  →  立即返回 tas
 
 - 接口文档见 `backend-full/README.md`，里面有每个接口的入参出参和踩坑记录
 - 数据库表结构由 `db/init.sql` 与 `backend-full/sql/schema-ai.sql` 两个脚本共同定义
-- 本项目为本科毕业设计，代码注释较密，重点记录了**为什么这么做**而不只是做了什么
+- 本项目为个人学习项目，代码注释较密，重点记录了**为什么这么做**而不只是做了什么
